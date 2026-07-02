@@ -3,7 +3,7 @@ package com.streamflixreborn.streamflix.utils
 import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.content.ContentValues
+import android.app.PendingIntent
 import android.util.Log
 import com.streamflixreborn.streamflix.fragments.player.PlayerMobileFragment
 import kotlinx.coroutines.CoroutineScope
@@ -12,13 +12,14 @@ import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import android.content.Context
+import android.content.Intent
 import android.os.Build
 import android.os.Environment
-import android.provider.MediaStore
 import androidx.annotation.RequiresApi
-import android.net.Uri
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
+import androidx.core.content.FileProvider
+import androidx.core.net.toUri
 import com.streamflixreborn.streamflix.R
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
@@ -29,6 +30,10 @@ import java.util.Collections
 import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
+import com.arthenica.ffmpegkit.FFmpegKit;
+import com.arthenica.ffmpegkit.ReturnCode;
+import kotlin.math.max
+
 @SuppressLint("MissingPermission")
 
 @RequiresApi(Build.VERSION_CODES.Q)
@@ -240,8 +245,7 @@ class M3uDownloader(
             audioSegToDownload = audioSegments.size
             videoSegToDownload = videoSegments.size
 
-            enqueueSegments(audioSegments)
-            enqueueSegments(videoSegments)
+            enqueueSegments(audioSegments, videoSegments)
         }
     }
 
@@ -327,9 +331,12 @@ class M3uDownloader(
         }
     }
 
-    private suspend fun enqueueSegments(segments: List<Segment>) {
-        for (s in segments) {
-            queue.send(s)
+    private suspend fun enqueueSegments(videoSegments: List<Segment>, audioSegments: List<Segment>) {
+        val max = max(audioSegments.size, videoSegments.size)
+
+        for (i in 0 until max) {
+            audioSegments.getOrNull(i)?.let { queue.send(it) }
+            videoSegments.getOrNull(i)?.let { queue.send(it) }
         }
     }
 
@@ -385,26 +392,6 @@ class M3uDownloader(
         }
     }
 
-    fun copyToDownloads(context: Context, file: File, out: String): Uri {
-        val resolver = context.contentResolver
-
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, out)
-            put(MediaStore.MediaColumns.MIME_TYPE, "video/mp2t")
-            put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
-        }
-
-        val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
-            ?: throw RuntimeException("Insert failed")
-
-        resolver.openOutputStream(uri)?.use { output ->
-            file.inputStream().use { input ->
-                input.copyTo(output)
-            }
-        }
-        return uri
-    }
-
     fun buildFinalStreams() {
         scope.launch(Dispatchers.IO) {
 
@@ -419,14 +406,47 @@ class M3uDownloader(
             Log.d("TS", "audio exists=${audioOutputFile.exists()} size=${audioOutputFile.length()}")
             Log.d("TS", "video exists=${videoOutputFile.exists()} size=${videoOutputFile.length()}")
 
-            copyToDownloads(context.applicationContext, audioOutputFile, "audio.ts")
-            copyToDownloads(context.applicationContext, videoOutputFile, "video.ts")
+
+            val outputFile = File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS),
+                "output.mp4"
+            )
+
+            notificationBuilder
+                .setProgress(0, 0, false)
+                .setContentTitle("Merging into mp4")
+                .setContentText("Merging into mp4!")
+            notificationManager.notify(notificationId, notificationBuilder.build())
+            resetState()
+
+            mergeToMp4(audioOutputFile, videoOutputFile, outputFile)
+
+            val uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.provider",
+                outputFile
+            )
+
+            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                setDataAndType(uri, "video/mp4")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+
+            val pendingIntent = PendingIntent.getActivity(
+                context,
+                0,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
 
             isDownloading = false
             notificationBuilder
                 .setProgress(0, 0, false)
-                .setContentTitle("Download Complete")
-                .setContentText("Download completed!")
+                .setContentTitle("Merge completed!")
+                .setContentText(outputFile.name)
+                .setContentIntent(pendingIntent)
+                .setProgress(0, 0, false)
             notificationManager.notify(notificationId, notificationBuilder.build())
             resetState()
         }
@@ -441,11 +461,6 @@ class M3uDownloader(
                 if (restartWatcher){ break }
                 delay(1000)
 
-                if (audioFiles.size == audioSegToDownload && videoFiles.size == videoSegToDownload) {
-                    Log.d("HLS", "Download complete → merging streams")
-                    buildFinalStreams()
-                    break
-                }
                 val progress = (audioFiles.size + videoFiles.size).toDouble() / (audioSegToDownload + videoSegToDownload).toDouble()*100
                 notificationBuilder.setProgress(100, progress.toInt(), false)
                 notificationManager.notify(notificationId, notificationBuilder.build())
@@ -453,7 +468,59 @@ class M3uDownloader(
                     "AUDIO/VIDEO DL:",
                     "${audioFiles.size}/$audioSegToDownload ${videoFiles.size}/$videoSegToDownload"
                 )
+
+                if (audioFiles.size == audioSegToDownload && videoFiles.size == videoSegToDownload) {
+                    Log.d("HLS", "Download complete → merging streams")
+                    buildFinalStreams()
+                    break
+                }
             }
+        }
+    }
+
+
+    fun mergeToMp4(audioInputFile: File, videoInputFile: File, outputMp4: File) {
+        scope.launch(Dispatchers.IO) {
+
+
+            if (!audioOutputFile.exists() || !videoOutputFile.exists()) {
+                Log.e("FFMPEG", "Missing TS files")
+                return@launch
+            }
+
+            val cmd = """
+            -i ${audioInputFile.path} 
+            -i ${videoInputFile.path}
+            -c:v copy
+            -c:a copy
+            -shortest 
+            $outputMp4
+        """.trimIndent().replace("\n", " ")
+
+            FFmpegKit.executeAsync(
+                cmd,
+                { session ->
+                    if (ReturnCode.isSuccess(session.returnCode)) {
+                        Log.d("FFMPEG", "Done")
+                    } else {
+                        Log.e("FFMPEG", "Failed")
+                    }
+                },
+                { log ->
+                    Log.d("FFMPEG", log.message)
+                },
+                { statistics ->
+                    val totalSize = videoInputFile.length() + audioInputFile.length()
+                    val processed = statistics.size
+                    val percent = (processed.toDouble() / totalSize * 100).toInt()
+                    notificationBuilder
+                        .setProgress(0, 0, false)
+                        .setContentTitle("Merging into mp4!")
+                        .setContentText("Merging int progress...")
+                        .setProgress(100, percent, false)
+                    notificationManager.notify(notificationId, notificationBuilder.build())
+                }
+            )
         }
     }
 }
