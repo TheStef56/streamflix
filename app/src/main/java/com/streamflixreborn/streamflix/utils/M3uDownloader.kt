@@ -61,7 +61,7 @@ class M3uDownloader(
 
     private var queue = Channel<Segment>(Channel.UNLIMITED)
 
-    private var title: String? = getArgs().title
+    private var title: String? = getArgs().title + getArgs().subtitle
 
     // paths
     private val tempDir: File by lazy {
@@ -240,7 +240,7 @@ class M3uDownloader(
             val videoSegments = parsePlaylist(bestVideo, "video")
             audioSegToDownload = audioSegments.size
             videoSegToDownload = videoSegments.size
-            title = getArgs().title
+            title = getArgs().title + getArgs().subtitle
             startCompletionWatcher()
             enqueueSegments(audioSegments, videoSegments)
         }
@@ -470,12 +470,12 @@ class M3uDownloader(
 
             val cmd = """
             -y
-            -i ${audioInputFile.path} 
-            -i ${videoInputFile.path}
+            -i '${audioInputFile.path}' 
+            -i '${videoInputFile.path}'
             -c:v copy
             -c:a copy
             -shortest 
-            $outputMp4
+            '$outputMp4'
         """.trimIndent().replace("\n", " ")
 
             FFmpegKit.executeAsync(
