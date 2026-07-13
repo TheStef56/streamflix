@@ -66,7 +66,7 @@ class VideoDownloader(
 
     private var queue = Channel<Segment>(Channel.UNLIMITED)
 
-    private var title: String? = getArgs().title + getArgs().subtitle
+    private var title: String? = "${getArgs().title} - ${getArgs().subtitle}"
 
     // paths
     private val tempDir: File by lazy {
