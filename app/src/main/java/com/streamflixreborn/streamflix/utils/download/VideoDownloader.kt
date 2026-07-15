@@ -603,7 +603,8 @@ data class HlsStream(
     val codecs: String? = null,
     val resolution: String? = null,
     val audioGroup: String? = null,
-    val type: String? = null
+    val type: String,
+    val isDefault: Boolean = false
 )
 
 fun parseBestStreams(m3u8: String): Pair<HlsStream?, HlsStream?> {
@@ -623,7 +624,9 @@ fun parseBestStreams(m3u8: String): Pair<HlsStream?, HlsStream?> {
                     streams += HlsStream(
                         uri = attrs["URI"]?.trim('"') ?: "",
                         codecs = "audio",
-                        type = "audio"
+                        type = "audio",
+                        audioGroup = attrs["GROUP-ID"]?.trim('"'),
+                        isDefault = attrs["DEFAULT"]?.equals("YES", ignoreCase = true) == true
                     )
                 }
             }
@@ -677,10 +680,11 @@ fun parseBestStreams(m3u8: String): Pair<HlsStream?, HlsStream?> {
         ).any { codecs.contains(it) }
     }
 
-    // Audio-only stream: must have audio and must NOT have video
-    val bestDedicatedAudio = streams
-        .filter { it.type == "audio" }
-        .maxByOrNull { it.bandwidth }
+    val dedicatedAudio = streams.filter { it.type == "audio" }
+
+    val bestDedicatedAudio =
+        dedicatedAudio.firstOrNull { it.isDefault }
+            ?: dedicatedAudio.maxByOrNull { it.bandwidth }
 
     val bestVideo = streams
         .filter { hasVideo(it) }
